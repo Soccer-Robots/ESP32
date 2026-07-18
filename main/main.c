@@ -686,8 +686,9 @@ void app_main() {
 
 	waitForData = xSemaphoreCreateBinary();
     
-	ESP_ERROR_CHECK(gptimer_new_timer(&config, &timer));
-
+    ESP_ERROR_CHECK(gptimer_new_timer(&config, &timer));
+    ESP_ERROR_CHECK(gptimer_enable(timer));
+    
 	ledc_setup();
 	
 	doBlink();
