@@ -1,984 +1,897 @@
 #include "wifi_connectivity.h"
 #include "goalpost_mechanism.h"
 
-#include "esp_log.h"
-#include "esp_err.h"
+#include <errno.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "freertos/projdefs.h"
+#include "esp_err.h"
+#include "esp_log.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+#include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "driver/ledc.h"
+
+#include "lwip/inet.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
-#include "driver/gpio.h"
-#include "driver/ledc.h"
-#include "hal/ledc_types.h"
+/* TCP server settings */
+#define PORT 30000
+#define KEEPALIVE_IDLE 5
+#define KEEPALIVE_INTERVAL 5
+#define KEEPALIVE_COUNT 3
 
-#include "freertos/idf_additions.h"
-#include "freertos/task.h"
+/* On-board/status LED */
+#define BLINK_GPIO GPIO_NUM_15
 
-#include "soc/clk_tree_defs.h"
+/* LEDC PWM settings */
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES LEDC_TIMER_10_BIT
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_FREQUENCY_HZ 10000U
+#define LEDC_MAX_DUTY ((1U << 10U) - 1U)
 
-// Wi-Fi connectivity
-#include <sys/socket.h>		// Sockets
-#include <unistd.h>			// Close
-#include <netdb.h>			// gethostbyname
+/* DRV8833 input pins */
+#define MOTOR_A_IN1_GPIO GPIO_NUM_14
+#define MOTOR_A_IN2_GPIO GPIO_NUM_13
+#define MOTOR_B_IN1_GPIO GPIO_NUM_21
+#define MOTOR_B_IN2_GPIO GPIO_NUM_17
 
-#include <math.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include "driver/timer.h"
-#include <fcntl.h>
-#include "freertos/semphr.h"
+/* Two LEDC channels per motor: forward and reverse */
+#define LEDC_CH_A_FWD LEDC_CHANNEL_0
+#define LEDC_CH_A_REV LEDC_CHANNEL_1
+#define LEDC_CH_B_FWD LEDC_CHANNEL_2
+#define LEDC_CH_B_REV LEDC_CHANNEL_3
 
-#define PORT					30000
-#define KEEPALIVE_IDLE			5
-#define KEEPALIVE_INTERVAL		5
-#define KEEPALIVE_COUNT			3
-
-#define BLINK_GPIO 15
-#define BLINK_PERIOD 1000
-
-#define LEDC_MODE               LEDC_LOW_SPEED_MODE
-#define LEDC_DUTY_RES           LEDC_TIMER_10_BIT      // 13-bit duty (0–8191) //changed to 10 bit
-#define LEDC_TIMER              LEDC_TIMER_0
-#define LEDC_FREQUENCY          10000                  // 20 kHz for DRV8833 //changed to 10kHz
-
-//DRV8833 input pins
-//Motor A (left): IN1, IN2
-#define MOTOR_A_IN1_GPIO        GPIO_NUM_14   // DRV8833 IN1 (forward)
-#define MOTOR_A_IN2_GPIO        GPIO_NUM_13   // DRV8833 IN2 (reverse)
-
-//Motor B (right): IN3, IN4
-#define MOTOR_B_IN1_GPIO        GPIO_NUM_21   // DRV8833 IN3 (forward)
-#define MOTOR_B_IN2_GPIO        GPIO_NUM_17   // DRV8833 IN4 (reverse)
-
-//LEDC channels – 2 per motor (fwd/rev)
-#define LEDC_CH_A_FWD           LEDC_CHANNEL_0
-#define LEDC_CH_A_REV           LEDC_CHANNEL_1
-#define LEDC_CH_B_FWD           LEDC_CHANNEL_2
-#define LEDC_CH_B_REV           LEDC_CHANNEL_3
-
-#define FADE_RESOLUTION			10
-
-static timer_config_t config = {
-    .alarm_en = TIMER_ALARM_DIS,        // don’t need alarm
-    .auto_reload = false,               // Auto-reload timer. Don’t want this
-	//currently, we are going to update the timer every half a millisecond, so we'll need to account for this.
-    .divider = 40000,                     // Timer clock divider (40000 gives a 0.5 millisecond resolution. )
-    .counter_dir = TIMER_COUNT_UP,     // Count upwards
-    .counter_en = false,         // Start the timer
-    .intr_type = TIMER_INTR_LEVEL,     // Interrupt type
-    .clk_src = TIMER_SRC_CLK_APB,      // Clock source (APB)
-};
-
-
-// Prototypes
-//static void setup();
-void move();
-
-typedef struct sockaddr SA;
-/* static const int ip_protocol = 0; */
-
-static uint8_t s_led_state = 0;
-
-static bool charging;
-static bool inGame;
-static bool resetting;
-
-// used to decide when we start reversing or moving forward and such (THIS WAS FOR ESC)
 /*
-static uint8_t lowerReverseBound = 16;
-static uint8_t upperReverseBound = 49;
-static uint8_t lowerForwardBound = 56;
-static uint8_t upperForwardBound = 89;
-*/
+ * Modern GPTimer configuration.
+ *
+ * A 1 MHz timer gives one timer count per microsecond. The motor command
+ * transition lasts 500 ms, matching the previous legacy timer behavior.
+ */
+#define MOVEMENT_TIMER_RESOLUTION_HZ 1000000U
+#define MOVEMENT_RAMP_DURATION_US 500000ULL
+#define MOVEMENT_UPDATE_PERIOD_MS 1U
 
-TaskHandle_t doMovementHandle = NULL;
-bool finishedMoving = false;
-bool interruptMovement = false;
+typedef struct
+{
+    bool forward;
+    bool left;
+    bool right;
+    bool back;
+} Movement;
 
-//the way we do it is first index - left motor, second index - right motor.
-
-//for currente direction, ti's between -100 and 100. negative numbers mean reverse motor,
-//and -100 reverses and greater speed than say -10, and 100 goes at faster spee than say
-//10. We will later map this to the proper duty values
-static float currentDirection[2] = {0, 0};
-//stores the direction values we are currently at and our starting values
-static int8_t currentTargets[2] = {0, 0};
-static float startTargets[2] = {0, 0};
-
-SemaphoreHandle_t waitForData;
-
-typedef struct {
+typedef struct
+{
     int8_t fullForward[2];
     int8_t fullBack[2];
     int8_t forwardLeft[2];
     int8_t forwardRight[2];
-	int8_t backLeft[2];
-	int8_t backRight[2];
+    int8_t backLeft[2];
+    int8_t backRight[2];
     int8_t fullLeft[2];
     int8_t fullRight[2];
     int8_t stop[2];
 } MoveTargets;
 
-// Initialize the struct after declaration. Basically depending on the input from the player, we will
-// drive the esp to one of the following targets.
-static MoveTargets moveTargets = {
-    
-    /*
-    {85, 85},
-    {-85, -85},
-    {35, 100},
-    {100, 35},
-	{-35, -100},
-	{-100, -35},
-    {-50, 50},
-    {50, -50},
-    {0, 0}
-    */
+static const char *TAG = "MAIN";
 
-    //the motor orientations are flipped, so need to reverse the second value in each pair
-    {95, -95},
-    {-95, 95},
-    {90, -100},
-    {100, -90},
-	{-90, 100},
-	{-100, 90},
-    {-90, -90},
-    {90, 90},
-    {0, 0}
-    
+/* Motor target values: index 0 = left motor, index 1 = right motor. */
+static const MoveTargets moveTargets = {
+    .fullForward = {95, -95},
+    .fullBack = {-95, 95},
+    .forwardLeft = {90, -100},
+    .forwardRight = {100, -90},
+    .backLeft = {-90, 100},
+    .backRight = {-100, 90},
+    .fullLeft = {-90, -90},
+    .fullRight = {90, 90},
+    .stop = {0, 0},
 };
 
-//got a function from desmos, we are just plugging it in
-float pwmFunction(uint8_t index, int16_t x)
+/*
+ * currentDirection ranges from -100 to 100:
+ *   negative = reverse
+ *   positive = forward
+ *   magnitude = requested motor power percentage
+ */
+static float currentDirection[2] = {0.0f, 0.0f};
+static int8_t currentTargets[2] = {0, 0};
+static float startTargets[2] = {0.0f, 0.0f};
+
+static Movement movementState = {
+    .forward = false,
+    .left = false,
+    .right = false,
+    .back = false,
+};
+
+static Movement *moveStruct = &movementState;
+
+static bool charging = false;
+static bool inGame = false;
+static bool resetting = false;
+
+/* These flags are shared between FreeRTOS tasks. */
+static volatile bool finishedMoving = false;
+static volatile bool interruptMovement = false;
+
+static TaskHandle_t doMovementHandle = NULL;
+static SemaphoreHandle_t waitForData = NULL;
+
+/* GPTimer state */
+static gptimer_handle_t movementTimer = NULL;
+static bool movementTimerRunning = false;
+
+/* Function prototypes */
+static void ledc_setup(void);
+static void movement_timer_setup(void);
+static void movement_timer_restart(void);
+static void movement_timer_stop(void);
+static void doBlink(void);
+void move(void);
+
+/* -------------------------------------------------------------------------- */
+/* Modern GPTimer setup                                                        */
+/* -------------------------------------------------------------------------- */
+
+static void movement_timer_setup(void)
 {
-	float a = fabs(currentTargets[index] - startTargets[index]);
-	float c = fmin(startTargets[index], currentTargets[index]);
-	float b;
-	//do this because when we divide currentTargets-startTargets, that'd otherwise be dividing by 0, which we avoid this way.
-	if(currentTargets[index] == startTargets[index])
-	{
-		b = 0;
-	}
-	else
-	{
-		b = (1/2.5) * (currentTargets[index] - startTargets[index]) / fabs(currentTargets[index] - startTargets[index]);
-	}
-	float returnVal = a / (1 + exp(-b*x/20)) + c;
-	return returnVal;
+    const gptimer_config_t timerConfig = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = MOVEMENT_TIMER_RESOLUTION_HZ,
+    };
+
+    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig, &movementTimer));
+    ESP_ERROR_CHECK(gptimer_enable(movementTimer));
 }
 
-//This will store the current input of what keys are being pressed
-typedef struct {
-	bool forward, left, right, back;
-} Movement;
-
-static Movement *moveStruct;
-
-// this takes in teh buffer sent from the pi, and sees which directions movement must go in
-void setMoveStruct(char *buffer, int length)
+static void movement_timer_restart(void)
 {
-	//resetting the struct.
-	moveStruct->forward = false;
-	moveStruct->back = false;
-	moveStruct->left = false;
-	moveStruct->right = false;
-
-	//now loop through buffer, if seeing the right keys, det it to true
-	for(int i = 0; i < length; i++)
-	{
-		if(buffer[i] == 'u')
-			moveStruct->forward = true;
-		if(buffer[i] == 'd')
-			moveStruct->back = true;
-		if(buffer[i] == 'l')
-			moveStruct->left  = true;
-		if(buffer[i] == 'r')
-			moveStruct->right = true;
-	}
-
-	//If pressing both, set them both to false.
-	if(moveStruct->forward == true && moveStruct->back == true)
-	{
-		moveStruct->forward = false;
-		moveStruct->back = false;
-	}
-	
-	//If pressing both, set them both to false.
-	if(moveStruct->left == true && moveStruct->right == true)
-	{
-		moveStruct->left = false;
-		moveStruct->right = false;
-	}
-}
-
-//this will iniitializve movement to a new target for the first time
-void beginMoving()
-{
-	//set start to current values
-	startTargets[0] = currentDirection[0];
-	startTargets[1] = currentDirection[1];
-	timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
-	// begin our timer
-	timer_start(TIMER_GROUP_0, TIMER_0);
-	//get final targets here
-	if(moveStruct->forward)
-	{
-		//forwared left
-		if(moveStruct->left)
-		{
-			currentTargets[0] = moveTargets.forwardLeft[0];
-			currentTargets[1] = moveTargets.forwardLeft[1];
-		}
-		//forward and right
-		else if(moveStruct->right)
-		{
-			currentTargets[0] = moveTargets.forwardRight[0];
-			currentTargets[1] = moveTargets.forwardRight[1];
-		}
-		//full forward
-		else
-		{
-			currentTargets[0] = moveTargets.fullForward[0];
-			currentTargets[1] = moveTargets.fullForward[1];
-		}
-	}
-	else if(moveStruct->back)
-	{
-		//back and pressing left
-		if(moveStruct->left)
-		{
-			currentTargets[0] = moveTargets.backLeft[0];
-			currentTargets[1] = moveTargets.backLeft[1];
-		}
-		//back and pressing right
-		else if(moveStruct->right)
-		{
-			currentTargets[0] = moveTargets.backRight[0];
-			currentTargets[1] = moveTargets.backRight[1];
-		}
-		//full force backward
-		else
-		{
-			currentTargets[0] = moveTargets.fullBack[0];
-			currentTargets[1] = moveTargets.fullBack[1];
-		}
-	}
-	//only going left, as we know forward and back aren't presssed
-	else if(moveStruct->left)
-	{
-		currentTargets[0] = moveTargets.fullLeft[0];
-		currentTargets[1] = moveTargets.fullLeft[1];
-	}
-	//only going right, as we know forward and back aren't pressed
-	else if(moveStruct->right)
-	{
-		currentTargets[0] = moveTargets.fullRight[0];
-		currentTargets[1] = moveTargets.fullRight[1];
-	}
-	//otherwise nothing is pressed, want to go back to being stationary.
-	else
-	{
-		currentTargets[0] = moveTargets.stop[0];
-		currentTargets[1] = moveTargets.stop[1];
-	}
-}
-
-//function to overall handle movement
-void doMovement(void *pvParameters)
-{
-	//always running while connected
-	while(true)
-	{
-		//once we about to start, assume movement interrupt has already been interrupted, so set
-		//to false again
-		interruptMovement = false;
-		//also, assume we just start moving again
-		finishedMoving = false;
-		//assume when we start, we begin moving
-		beginMoving();
-		//this is the look to move the new target
-		while(true)
-		{
-			uint64_t x = 0;
-			timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &x);
-			//we'll need to do x / 2 - 250 for two reasons. First, we divide by 2 because the timer increments every half a millisecond, so its value
-			//is double what we need. Also, it only allows positive values, so we have to make it from 0-500 and then subtract by 250 to get -250 to 250.
-
-            /*
-			ESP_LOGI("DEBUG", "Direction Left is %f, Direction Right is %f, forward is %d, left is %d, right is %d, back is %d, x is %d.", 
-				currentDirection[0], currentDirection[1], moveStruct->forward, moveStruct->left, moveStruct->right, moveStruct->back, (int16_t) (x/2 - 250));	
-	        */
-
-			//once we reach our limit, we break out of our movement loop and wait
-			if(x >= 1000)
-			{
-				//pause our hardware timer so it's not constantly running, and break out the loop to begin waiting
-				timer_pause(TIMER_GROUP_0, TIMER_0);
-				break;
-			}
-
-			//otherwise, keep updating
-			currentDirection[0] = pwmFunction(0, (int16_t) (x/2 - 250));
-			currentDirection[1] = pwmFunction(1, (int16_t) (x/2 - 250));
-			move();	
-			taskYIELD();
-
-			//if we're given command to interrupt movement due to new keys before we finish, break anyways
-			if(interruptMovement)
-			{
-				break;
-			}
-		}
-		//if interrupting movement, don't want to take the semaphore, cause we've just been given command to interrupt movement, so avoid with this "continue" keyword
-		if(interruptMovement)
-		{
-			continue;
-		}
-		//wait until new data is sent after we've reached our target
-		finishedMoving = true;
-		ESP_LOGI("SNOOZE", "Snoozing until new data!");
-		//wait for new data and snooze to save CPU cycles
-		xSemaphoreTake(waitForData, portMAX_DELAY);
-		ESP_LOGI("SNOOZE", "LOCK IN, got new data!");
-	}
-}
-
-//C has no send_all like python does, so we have to manually create it. Means all messages sent to the pi have to end with delimiter |
-static void sendMessage(const int sock, const char* message)
-{
-	send(sock, message, strlen(message), 0);
-	//delimiter to let reaspberry pi know this is the end of that message
-	send(sock, "|", 1, 0);
-}
-
-//C has no recv_all like python does, so we basically have to manually create it. This means all messages sent to the esp have to end with a delimiter |
-static int receiveMessage(const int sock, char* rx_buffer)
-{
-	uint8_t length = 0;
-	//continue reading until we get a delimeter
-	while(true)
-	{
-		int8_t status = recv(sock, rx_buffer + length, 1, 0);
-		ESP_LOGI("BIT", "Got char %c", *(rx_buffer + length));
-		if(status == -1)
-		{
-			return -1;
-		}
-		if(status == 0)
-		{
-			return 0;
-		}
-		if(*(rx_buffer + length) == '|')
-		{
-			break;
-		}
-		length++;
-	}
-	return length;
-}
-
-//in general handles receiving data from the pi
-static void on_receive(const int sock)
-{
-    int len;
-    char rx_buffer[128];
-	char* TAG = "SERVER_EVENT";
-
-    do 
-	{
-        
-		// wait for message first
-		len = receiveMessage(sock, rx_buffer);
-        if (len < 0) {
-            ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
-        } else if (len == 0) {
-            ESP_LOGW(TAG, "Connection closed");
-        } else {
-            rx_buffer[len] = '\0'; // Null-terminate whatever is received and treat it like a string
-
-			//if received a readyCheck message, return the right result
-			if(len >= 10 && strncmp(rx_buffer, "readyCheck", 10) == 0)
-			{
-				ESP_LOGI("MESSAGE", "Ready message received!");
-				//if its any of these, are not read
-				if(charging || resetting || inGame)
-				{
-					//send not ready
-					sendMessage(sock, "not-ready");
-				}
-				else
-				{
-					//send ready
-					sendMessage(sock, "ready");
-					inGame = true;
-					//set up movement as we about to begin the game
-					xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
-				}
-				continue;
-			}
-			//if received game over message, break out
-			if(len >= 5 && strncmp(rx_buffer, "reset", 5) == 0)
-			{
-				inGame = false;
-				//set to z just to mean we are now moving both motors to 0.
-				setMoveStruct((char*) "z", 1);
-				//assume we will now move to 0, even if already at 0.
-				finishedMoving = false;
-
-				//set both as a bit of overkill, but to make sure the esp will run the command to stop for sure
-				interruptMovement = true;
-				xSemaphoreGive(waitForData);
-
-				//set movement drive to zero
-				//for now, we can probably just break our esp out of this on receive, that will also destroy the movement task. Though, that's only after we finish moving.
-				break;
-			}
-			//if received an ignore message, ignore it
-			if(len >= 6 && strncmp(rx_buffer, "ignore", 6) == 0)
-			{
-				ESP_LOGI("MESSAGE", "Ignore message received!");
-				continue;
-			}
-            ESP_LOGI(TAG, "Received %d bytes: %s", len, rx_buffer);
-			setMoveStruct(rx_buffer, len);
-			//if we were already moving but haven't reached our target, want to now tell the esp that we're gonna interrupt now.
-			if(!finishedMoving)
-			{
-				interruptMovement = true;
-			}
-			//always give semaphore, as it's a possible race condition still that we mmight interrupt movement and then in our movement task before
-			//we do the break we stop moving. It's a binary semaphore so it's not a big deal
-			xSemaphoreGive(waitForData);
-			
-            // send() can return less bytes than supplied length.
-            // Walk-around for robust implementation.
-            
-			//i think for now we don't really need to send back to the raspberry pi. Maybe change this later
-
-			// int to_write = len;
-            // while (to_write > 0) {
-            //     int written = send(sock, rx_buffer + (len - to_write), to_write, 0);
-            //     if (written < 0) {
-            //         ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-            //         // Failed to retransmit, giving up
-            //         return;
-            //     }
-            //     to_write -= written;
-            // }
-        }
-    } while (len > 0);
-}
-
-//overall handles connection with the pi through a TCP connection with a socket.
-void taskServer(void *pvParameters){	
-	char* TAG = "SERVER";
-    char addr_str[128];
-    int addr_family = (int)pvParameters;
-    int ip_protocol = 0;
-    int keepAlive = 1;
-    int keepIdle = KEEPALIVE_IDLE;
-    int keepInterval = KEEPALIVE_INTERVAL;
-    int keepCount = KEEPALIVE_COUNT;
-    struct sockaddr_storage dest_addr;
-
-	// IPv4 Socket Structure Configuration, using current IP and selected Port #
-    if (addr_family == AF_INET) {
-        struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
-        dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
-        dest_addr_ip4->sin_family = AF_INET;
-        dest_addr_ip4->sin_port = htons(PORT);
-        ip_protocol = IPPROTO_IP;
+    if (movementTimerRunning)
+    {
+        ESP_ERROR_CHECK(gptimer_stop(movementTimer));
+        movementTimerRunning = false;
     }
 
-	// Create Socket
-    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+    ESP_ERROR_CHECK(gptimer_set_raw_count(movementTimer, 0));
+    ESP_ERROR_CHECK(gptimer_start(movementTimer));
+    movementTimerRunning = true;
+}
+
+static void movement_timer_stop(void)
+{
+    if (movementTimerRunning)
+    {
+        ESP_ERROR_CHECK(gptimer_stop(movementTimer));
+        movementTimerRunning = false;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Movement command handling                                                   */
+/* -------------------------------------------------------------------------- */
+
+static float pwmFunction(uint8_t index, int32_t x)
+{
+    const float target = (float)currentTargets[index];
+    const float start = startTargets[index];
+    const float difference = target - start;
+
+    if (fabsf(difference) < 0.001f)
+    {
+        return target;
+    }
+
+    const float amplitude = fabsf(difference);
+    const float lowerValue = fminf(start, target);
+    const float direction = (difference > 0.0f) ? 1.0f : -1.0f;
+    const float slope = (1.0f / 2.5f) * direction;
+
+    return amplitude / (1.0f + expf((-slope * (float)x) / 20.0f)) + lowerValue;
+}
+
+void setMoveStruct(char *buffer, int length)
+{
+    if (buffer == NULL || length < 0)
+    {
+        return;
+    }
+
+    moveStruct->forward = false;
+    moveStruct->back = false;
+    moveStruct->left = false;
+    moveStruct->right = false;
+
+    for (int i = 0; i < length; i++)
+    {
+        switch (buffer[i])
+        {
+        case 'u':
+            moveStruct->forward = true;
+            break;
+        case 'd':
+            moveStruct->back = true;
+            break;
+        case 'l':
+            moveStruct->left = true;
+            break;
+        case 'r':
+            moveStruct->right = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (moveStruct->forward && moveStruct->back)
+    {
+        moveStruct->forward = false;
+        moveStruct->back = false;
+    }
+
+    if (moveStruct->left && moveStruct->right)
+    {
+        moveStruct->left = false;
+        moveStruct->right = false;
+    }
+}
+
+static void select_movement_targets(void)
+{
+    if (moveStruct->forward)
+    {
+        if (moveStruct->left)
+        {
+            currentTargets[0] = moveTargets.forwardLeft[0];
+            currentTargets[1] = moveTargets.forwardLeft[1];
+        }
+        else if (moveStruct->right)
+        {
+            currentTargets[0] = moveTargets.forwardRight[0];
+            currentTargets[1] = moveTargets.forwardRight[1];
+        }
+        else
+        {
+            currentTargets[0] = moveTargets.fullForward[0];
+            currentTargets[1] = moveTargets.fullForward[1];
+        }
+    }
+    else if (moveStruct->back)
+    {
+        if (moveStruct->left)
+        {
+            currentTargets[0] = moveTargets.backLeft[0];
+            currentTargets[1] = moveTargets.backLeft[1];
+        }
+        else if (moveStruct->right)
+        {
+            currentTargets[0] = moveTargets.backRight[0];
+            currentTargets[1] = moveTargets.backRight[1];
+        }
+        else
+        {
+            currentTargets[0] = moveTargets.fullBack[0];
+            currentTargets[1] = moveTargets.fullBack[1];
+        }
+    }
+    else if (moveStruct->left)
+    {
+        currentTargets[0] = moveTargets.fullLeft[0];
+        currentTargets[1] = moveTargets.fullLeft[1];
+    }
+    else if (moveStruct->right)
+    {
+        currentTargets[0] = moveTargets.fullRight[0];
+        currentTargets[1] = moveTargets.fullRight[1];
+    }
+    else
+    {
+        currentTargets[0] = moveTargets.stop[0];
+        currentTargets[1] = moveTargets.stop[1];
+    }
+}
+
+void beginMoving(void)
+{
+    startTargets[0] = currentDirection[0];
+    startTargets[1] = currentDirection[1];
+
+    select_movement_targets();
+    movement_timer_restart();
+}
+
+void doMovement(void *pvParameters)
+{
+    (void)pvParameters;
+
+    while (true)
+    {
+        interruptMovement = false;
+        finishedMoving = false;
+
+        beginMoving();
+
+        while (true)
+        {
+            uint64_t elapsedUs = 0;
+            ESP_ERROR_CHECK(gptimer_get_raw_count(movementTimer, &elapsedUs));
+
+            if (elapsedUs >= MOVEMENT_RAMP_DURATION_US)
+            {
+                /*
+                 * End at the exact target instead of stopping one iteration
+                 * short of it.
+                 */
+                currentDirection[0] = (float)currentTargets[0];
+                currentDirection[1] = (float)currentTargets[1];
+                move();
+
+                movement_timer_stop();
+                break;
+            }
+
+            /*
+             * Convert elapsed time from 0...500 ms into the original
+             * sigmoid input range of approximately -250...250.
+             */
+            const int32_t curveX = (int32_t)(elapsedUs / 1000ULL) - 250;
+
+            currentDirection[0] = pwmFunction(0, curveX);
+            currentDirection[1] = pwmFunction(1, curveX);
+            move();
+
+            if (interruptMovement)
+            {
+                movement_timer_stop();
+                break;
+            }
+
+            /*
+             * A 1 ms delay prevents this task from monopolizing the CPU while
+             * still providing smooth motor updates.
+             */
+            vTaskDelay(pdMS_TO_TICKS(MOVEMENT_UPDATE_PERIOD_MS));
+        }
+
+        if (interruptMovement)
+        {
+            /*
+             * The sender gave the semaphore to wake this task, but an
+             * interrupted ramp does not block on it. Consume that stale token.
+             */
+            (void)xSemaphoreTake(waitForData, 0);
+            continue;
+        }
+
+        finishedMoving = true;
+        ESP_LOGI("MOVEMENT", "Target reached; waiting for a new command");
+
+        xSemaphoreTake(waitForData, portMAX_DELAY);
+
+        ESP_LOGI("MOVEMENT", "New movement command received");
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* TCP server                                                                  */
+/* -------------------------------------------------------------------------- */
+
+static bool send_all(int sock, const char *data, size_t length)
+{
+    size_t sentTotal = 0;
+
+    while (sentTotal < length)
+    {
+        const int sent = send(sock, data + sentTotal, length - sentTotal, 0);
+        if (sent < 0)
+        {
+            return false;
+        }
+
+        if (sent == 0)
+        {
+            errno = ECONNRESET;
+            return false;
+        }
+
+        sentTotal += (size_t)sent;
+    }
+
+    return true;
+}
+
+static bool sendMessage(int sock, const char *message)
+{
+    if (message == NULL)
+    {
+        errno = EINVAL;
+        return false;
+    }
+
+    return send_all(sock, message, strlen(message)) && send_all(sock, "|", 1);
+}
+
+static int receiveMessage(int sock, char *rxBuffer, size_t bufferSize)
+{
+    if (rxBuffer == NULL || bufferSize < 2)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t length = 0;
+
+    while (length < bufferSize - 1)
+    {
+        char receivedChar = '\0';
+        const int status = recv(sock, &receivedChar, 1, 0);
+
+        if (status < 0)
+        {
+            return -1;
+        }
+
+        if (status == 0)
+        {
+            return 0;
+        }
+
+        if (receivedChar == '|')
+        {
+            rxBuffer[length] = '\0';
+            return (int)length;
+        }
+
+        rxBuffer[length++] = receivedChar;
+    }
+
+    rxBuffer[bufferSize - 1] = '\0';
+    errno = EMSGSIZE;
+    return -1;
+}
+
+static void on_receive(int sock)
+{
+    char rxBuffer[128];
+    static const char *SERVER_TAG = "SERVER_EVENT";
+
+    while (true)
+    {
+        const int length = receiveMessage(sock, rxBuffer, sizeof(rxBuffer));
+
+        if (length < 0)
+        {
+            ESP_LOGE(SERVER_TAG, "Receive failed: errno %d", errno);
+            return;
+        }
+
+        if (length == 0)
+        {
+            ESP_LOGW(SERVER_TAG, "Connection closed");
+            return;
+        }
+
+        if (length >= 10 && strncmp(rxBuffer, "readyCheck", 10) == 0)
+        {
+            ESP_LOGI("MESSAGE", "Ready-check message received");
+
+            if (charging || resetting || inGame)
+            {
+                if (!sendMessage(sock, "not-ready"))
+                {
+                    ESP_LOGE(SERVER_TAG, "Failed to send not-ready response");
+                    return;
+                }
+            }
+            else
+            {
+                if (!sendMessage(sock, "ready"))
+                {
+                    ESP_LOGE(SERVER_TAG, "Failed to send ready response");
+                    return;
+                }
+
+                inGame = true;
+
+                if (doMovementHandle == NULL)
+                {
+                    const BaseType_t created = xTaskCreate(
+                        doMovement,
+                        "doMovement",
+                        8192,
+                        NULL,
+                        3,
+                        &doMovementHandle);
+
+                    if (created != pdPASS)
+                    {
+                        doMovementHandle = NULL;
+                        ESP_LOGE(SERVER_TAG, "Could not create movement task");
+                        return;
+                    }
+                }
+            }
+
+            continue;
+        }
+
+        if (length >= 5 && strncmp(rxBuffer, "reset", 5) == 0)
+        {
+            inGame = false;
+            setMoveStruct("z", 1);
+
+            finishedMoving = false;
+            interruptMovement = true;
+            xSemaphoreGive(waitForData);
+            return;
+        }
+
+        if (length >= 6 && strncmp(rxBuffer, "ignore", 6) == 0)
+        {
+            ESP_LOGI("MESSAGE", "Ignore message received");
+            continue;
+        }
+
+        ESP_LOGI(SERVER_TAG, "Received %d bytes: %s", length, rxBuffer);
+
+        setMoveStruct(rxBuffer, length);
+
+        if (!finishedMoving)
+        {
+            interruptMovement = true;
+        }
+
+        xSemaphoreGive(waitForData);
+    }
+}
+
+void taskServer(void *pvParameters)
+{
+    static const char *SERVER_TAG = "SERVER";
+    const int addressFamily = (int)(intptr_t)pvParameters;
+
+    char addressString[128] = {0};
+    int ipProtocol = 0;
+
+    const int keepAlive = 1;
+    const int keepIdle = KEEPALIVE_IDLE;
+    const int keepInterval = KEEPALIVE_INTERVAL;
+    const int keepCount = KEEPALIVE_COUNT;
+
+    struct sockaddr_storage destinationAddress;
+    memset(&destinationAddress, 0, sizeof(destinationAddress));
+
+    if (addressFamily == AF_INET)
+    {
+        struct sockaddr_in *destinationIpv4 =
+            (struct sockaddr_in *)&destinationAddress;
+
+        destinationIpv4->sin_addr.s_addr = htonl(INADDR_ANY);
+        destinationIpv4->sin_family = AF_INET;
+        destinationIpv4->sin_port = htons(PORT);
+        ipProtocol = IPPROTO_IP;
+    }
+    else
+    {
+        ESP_LOGE(SERVER_TAG, "Unsupported address family: %d", addressFamily);
         vTaskDelete(NULL);
         return;
     }
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    ESP_LOGI(TAG, "Socket created");
-
-	// Bind socket to current IP address using newly created structure
-    int err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err != 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        ESP_LOGE(TAG, "IPPROTO: %d", addr_family);
-        goto CLEAN_UP;
-    }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-
-	// Start listening for connections
-    err = listen(listen_sock, 1);
-    if (err != 0) {
-        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
-        goto CLEAN_UP;
+    const int listenSocket = socket(addressFamily, SOCK_STREAM, ipProtocol);
+    if (listenSocket < 0)
+    {
+        ESP_LOGE(SERVER_TAG, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
     }
 
-	//continue reading until socket breaks, then loop back
-    while (1) 
-	{
-        ESP_LOGI(TAG, "Socket listening");
-		
-		// Accept a connection, collect client's IP
-		struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
-        socklen_t addr_len = sizeof(source_addr);
-        int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+    const int reuseAddress = 1;
+    (void)setsockopt(
+        listenSocket,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &reuseAddress,
+        sizeof(reuseAddress));
+
+    ESP_LOGI(SERVER_TAG, "Socket created");
+
+    int error = bind(
+        listenSocket,
+        (struct sockaddr *)&destinationAddress,
+        sizeof(destinationAddress));
+
+    if (error != 0)
+    {
+        ESP_LOGE(SERVER_TAG, "Socket bind failed: errno %d", errno);
+        close(listenSocket);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    error = listen(listenSocket, 1);
+    if (error != 0)
+    {
+        ESP_LOGE(SERVER_TAG, "Socket listen failed: errno %d", errno);
+        close(listenSocket);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true)
+    {
+        ESP_LOGI(SERVER_TAG, "Socket listening on port %d", PORT);
+
+        struct sockaddr_storage sourceAddress;
+        socklen_t addressLength = sizeof(sourceAddress);
+
+        const int clientSocket = accept(
+            listenSocket,
+            (struct sockaddr *)&sourceAddress,
+            &addressLength);
+
+        if (clientSocket < 0)
+        {
+            ESP_LOGE(SERVER_TAG, "Accept failed: errno %d", errno);
             break;
         }
 
-        // Set tcp keepalive option
-        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+        (void)setsockopt(
+            clientSocket,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &keepAlive,
+            sizeof(keepAlive));
+        (void)setsockopt(
+            clientSocket,
+            IPPROTO_TCP,
+            TCP_KEEPIDLE,
+            &keepIdle,
+            sizeof(keepIdle));
+        (void)setsockopt(
+            clientSocket,
+            IPPROTO_TCP,
+            TCP_KEEPINTVL,
+            &keepInterval,
+            sizeof(keepInterval));
+        (void)setsockopt(
+            clientSocket,
+            IPPROTO_TCP,
+            TCP_KEEPCNT,
+            &keepCount,
+            sizeof(keepCount));
 
-		//Still having it block
-		// int prevFlags = fcntl(sock, F_GETFL, 0);
-		// fcntl(listen_sock, F_SETFL, prevFlags | O_NONBLOCK);
-
-        // Convert ip address to string
-		if (source_addr.ss_family == PF_INET) {
-            inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+        if (sourceAddress.ss_family == PF_INET)
+        {
+            inet_ntoa_r(
+                ((struct sockaddr_in *)&sourceAddress)->sin_addr,
+                addressString,
+                sizeof(addressString));
         }
-        ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
-		//create task to do movement
 
-		// Respond to client
-        on_receive(sock);
+        ESP_LOGI(SERVER_TAG, "Accepted connection from %s", addressString);
 
-		// Close client socket
-        shutdown(sock, 0);
+        on_receive(clientSocket);
 
-		//before finishing the movement task, spin until it's done.
-		while(finishedMoving != true)
-		{
-			//helps it defer to other tasks instead of spinning forever and ever
-			vTaskDelay(pdMS_TO_TICKS(10));
-		}
-		ESP_LOGI("DEBUG", "Finished Waiting!");
-		//delete the movement task since socket disconnected
-		vTaskDelete(doMovementHandle);
-		doMovementHandle = NULL;
+        shutdown(clientSocket, SHUT_RDWR);
+        close(clientSocket);
 
-        close(sock);
+        if (doMovementHandle != NULL)
+        {
+            while (!finishedMoving)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            vTaskDelete(doMovementHandle);
+            doMovementHandle = NULL;
+        }
     }
 
-CLEAN_UP:
-    close(listen_sock);
+    close(listenSocket);
     vTaskDelete(NULL);
 }
 
-//Raw Duty = (Percent/100) * (2^LEDC_DUTY_RES)
+/* -------------------------------------------------------------------------- */
+/* LEDC motor control                                                          */
+/* -------------------------------------------------------------------------- */
 
-//Gets the raw duty value from the percentage from 0 to 100. 
-float getRawDutyFromPercent(float duty){	
-    /*
-	//divide to convert from percent to decimal
-	duty /= 100;	
-	return (pow(2, LEDC_DUTY_RES) * duty);
-    */
-    // clamp input to 0–100 so nothing weird happens
-    if (duty < 0.0f) duty = 0.0f;
-    if (duty > 100.0f) duty = 100.0f;
-
-    // compute the maximum raw duty value: 2^N - 1
-    float max_duty = (1 << LEDC_DUTY_RES) - 1;   // e.g. 1023 for 10-bit
-
-    // scale percent 0–100 → raw 0–max_duty
-    return (max_duty * (duty / 100.0f));
-}
-
-//unused method, but we do keep it just in case. 
-float getPercentFromRawDuty(float duty)
+static uint32_t getRawDutyFromPercent(float dutyPercent)
 {
-	return (duty*100)/(pow(2, LEDC_DUTY_RES));
-}
-
-// Convert -100..100 "direction" into a raw duty magnitude for PWM
-// Sign (positive/negative) is handled separately in move()
-float getRawDutyFromBaseDirection(float dir)
-{
-    float mag = fabsf(dir);          // 0..100
-    if (mag < 1.0f) {
-        return 0.0f;                 // treat tiny values as stop
+    if (dutyPercent < 0.0f)
+    {
+        dutyPercent = 0.0f;
     }
-    if (mag > 100.0f) {
-        mag = 100.0f;                // clamp
+    else if (dutyPercent > 100.0f)
+    {
+        dutyPercent = 100.0f;
     }
-    return getRawDutyFromPercent(mag);
+
+    return (uint32_t)lroundf(
+        ((float)LEDC_MAX_DUTY * dutyPercent) / 100.0f);
 }
 
-
-//converts pulse width (in ms) to the proper duty cycle RAW. Not sure if this is right, may have to check
-float convertPulseWidthToPercentDuty(int pulseWidth)
+static uint32_t getRawDutyFromBaseDirection(float direction)
 {
-	//get it with pulse width over period. Convert from microseconds to seconds too.
-	return pulseWidth/(pow(10, 6)/LEDC_FREQUENCY) * 100;
+    float magnitude = fabsf(direction);
+
+    if (magnitude < 1.0f)
+    {
+        return 0;
+    }
+
+    if (magnitude > 100.0f)
+    {
+        magnitude = 100.0f;
+    }
+
+    return getRawDutyFromPercent(magnitude);
 }
 
-static void ledc_setup(){
-    // Timer configuration – shared by all channels
-    ledc_timer_config_t timer_conf = {
-        .speed_mode       = LEDC_MODE,
-        .duty_resolution  = LEDC_DUTY_RES,
-        .timer_num        = LEDC_TIMER,
-        .freq_hz          = LEDC_FREQUENCY,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
-
-    // Motor A – forward (IN1)
-    ledc_channel_config_t ch_a_fwd = {
+static void configure_ledc_channel(
+    ledc_channel_t channel,
+    gpio_num_t gpioNumber)
+{
+    const ledc_channel_config_t channelConfig = {
+        .gpio_num = gpioNumber,
         .speed_mode = LEDC_MODE,
-        .channel    = LEDC_CH_A_FWD,
-        .timer_sel  = LEDC_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = MOTOR_A_IN1_GPIO,
-        .duty       = 0,
-        .hpoint     = 0
+        .channel = channel,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+        .flags.output_invert = 0,
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&ch_a_fwd));
 
-    // Motor A – reverse (IN2)
-    ledc_channel_config_t ch_a_rev = {
+    ESP_ERROR_CHECK(ledc_channel_config(&channelConfig));
+}
+
+static void set_ledc_duty(ledc_channel_t channel, uint32_t duty)
+{
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, channel, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, channel));
+}
+
+static void ledc_setup(void)
+{
+    const ledc_timer_config_t timerConfig = {
         .speed_mode = LEDC_MODE,
-        .channel    = LEDC_CH_A_REV,
-        .timer_sel  = LEDC_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = MOTOR_A_IN2_GPIO,
-        .duty       = 0,
-        .hpoint     = 0
+        .duty_resolution = LEDC_DUTY_RES,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_FREQUENCY_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+        .deconfigure = false,
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&ch_a_rev));
 
-    // Motor B – forward (IN3)
-    ledc_channel_config_t ch_b_fwd = {
-        .speed_mode = LEDC_MODE,
-        .channel    = LEDC_CH_B_FWD,
-        .timer_sel  = LEDC_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = MOTOR_B_IN1_GPIO,
-        .duty       = 0,
-        .hpoint     = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ch_b_fwd));
+    ESP_ERROR_CHECK(ledc_timer_config(&timerConfig));
 
-    // Motor B – reverse (IN4)
-    ledc_channel_config_t ch_b_rev = {
-        .speed_mode = LEDC_MODE,
-        .channel    = LEDC_CH_B_REV,
-        .timer_sel  = LEDC_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = MOTOR_B_IN2_GPIO,
-        .duty       = 0,
-        .hpoint     = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ch_b_rev));
+    configure_ledc_channel(LEDC_CH_A_FWD, MOTOR_A_IN1_GPIO);
+    configure_ledc_channel(LEDC_CH_A_REV, MOTOR_A_IN2_GPIO);
+    configure_ledc_channel(LEDC_CH_B_FWD, MOTOR_B_IN1_GPIO);
+    configure_ledc_channel(LEDC_CH_B_REV, MOTOR_B_IN2_GPIO);
 
-    // Start with everything stopped
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_FWD, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_FWD));
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_REV, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_REV));
-
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_FWD, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_FWD));
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_REV, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_REV));
+    set_ledc_duty(LEDC_CH_A_FWD, 0);
+    set_ledc_duty(LEDC_CH_A_REV, 0);
+    set_ledc_duty(LEDC_CH_B_FWD, 0);
+    set_ledc_duty(LEDC_CH_B_REV, 0);
 }
 
+void move(void)
+{
+    const float leftDirection = currentDirection[0];
+    const uint32_t leftDuty =
+        getRawDutyFromBaseDirection(leftDirection);
 
-void move(){
-    // Left motor = motor A
-    float dirA = currentDirection[0];      // -100..100
-    float dutyA = getRawDutyFromBaseDirection(dirA);
-
-    if (fabsf(dirA) < 1.0f) {
-        // Stop: both inputs low -> coast
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_FWD, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_REV, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_REV));
-    } else if (dirA > 0) {
-        // Forward: PWM on IN1, IN2 low
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_FWD, (uint32_t)dutyA));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_REV, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_REV));
-    } else {
-        // Reverse: PWM on IN2, IN1 low
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_FWD, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_A_REV, (uint32_t)dutyA));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_A_REV));
+    if (fabsf(leftDirection) < 1.0f)
+    {
+        set_ledc_duty(LEDC_CH_A_FWD, 0);
+        set_ledc_duty(LEDC_CH_A_REV, 0);
+    }
+    else if (leftDirection > 0.0f)
+    {
+        set_ledc_duty(LEDC_CH_A_FWD, leftDuty);
+        set_ledc_duty(LEDC_CH_A_REV, 0);
+    }
+    else
+    {
+        set_ledc_duty(LEDC_CH_A_FWD, 0);
+        set_ledc_duty(LEDC_CH_A_REV, leftDuty);
     }
 
-    // Right motor = motor B
-    float dirB = currentDirection[1];
-    float dutyB = getRawDutyFromBaseDirection(dirB);
+    const float rightDirection = currentDirection[1];
+    const uint32_t rightDuty =
+        getRawDutyFromBaseDirection(rightDirection);
 
-    if (fabsf(dirB) < 1.0f) {
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_FWD, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_REV, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_REV));
-    } else if (dirB > 0) {
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_FWD, (uint32_t)dutyB));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_REV, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_REV));
-    } else {
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_FWD, 0));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_FWD));
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CH_B_REV, (uint32_t)dutyB));
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CH_B_REV));
+    if (fabsf(rightDirection) < 1.0f)
+    {
+        set_ledc_duty(LEDC_CH_B_FWD, 0);
+        set_ledc_duty(LEDC_CH_B_REV, 0);
     }
-
-    // Now:
-    //  - (IN1,IN2) = (PWM,0) → forward with PWM
-    //  - (IN1,IN2) = (0,PWM) → reverse with PWM
-    //  - (0,0) → coast
-}
-
-
-//just quickly putting the on-chip LED to high
-void doBlink()
-{
-	gpio_reset_pin(BLINK_GPIO);
-	gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
-	s_led_state = 1;
-	gpio_set_level(BLINK_GPIO, s_led_state);
-}
-
-/*
-void app_main(void)
-{
-    //blink so we know the ESP32 booted
-    //doBlink();
-    //vTaskDelay(pdMS_TO_TICKS(500));
-
-    //set up PWM for the DRV8833 motor driver
-    ledc_setup();
-	move();
-
-	
-    while (1) {
-
-        //both motors forward (about 40% power)
-        currentDirection[0] = 40;   //left motor
-        currentDirection[1] = 40;   //right motor
-        move();
-        ESP_LOGI("MOTOR_TEST", "Forward");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-
-        //stop
-        currentDirection[0] = 0;
-        currentDirection[1] = 0;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Stop");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-
-
-        //both motors reverse
-        currentDirection[0] = -40;
-        currentDirection[1] = -40;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Reverse");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        //spin in place (left fwd, right rev)
-        currentDirection[0] = 40;    // Left forward
-        currentDirection[1] = -40;   // Right reverse
-        move();
-        ESP_LOGI("MOTOR_TEST", "Spin in place");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        //stop again
-        currentDirection[0] = 0;
-        currentDirection[1] = 0;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Stop");
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    else if (rightDirection > 0.0f)
+    {
+        set_ledc_duty(LEDC_CH_B_FWD, rightDuty);
+        set_ledc_duty(LEDC_CH_B_REV, 0);
     }
-		
-}
-*/
-
-//where the program initially starts
-/*
-void app_main() {
-	//allocate space for struct, initially set everything to false
-	moveStruct = malloc(sizeof(Movement));
-	*moveStruct = (Movement) {false, false, false, false};
-	charging = false;
-	inGame = false;
-	resetting = false;
-	waitForData = xSemaphoreCreateBinary();
-	timer_init(TIMER_GROUP_0, TIMER_0, &config);
-	ledc_setup();
-	
-	doBlink();
-
-	vTaskDelay(pdMS_TO_TICKS(1000));
-
-    xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
-
-	vTaskDelay(pdMS_TO_TICKS(3000));
-	if (wifi_setup_init()){
-		xTaskCreate(taskServer, "taskServer", 4096, (void*)AF_INET, 3, NULL);
-	}
-
-	vTaskDelay(pdMS_TO_TICKS(500));
-}
-*/
-
-/*
-//PWM motor test code
-void app_main(void)
-{
-    //blink so we know the ESP32 booted
-    doBlink();
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    //set up PWM for the DRV8833 motor driver
-    ledc_setup();
-
-	
-    while (1) {
-
-        //both motors forward (about 40% power)
-        currentDirection[0] = 90;   //left motor
-        currentDirection[1] = 90;   //right motor
-        move();
-        ESP_LOGI("MOTOR_TEST", "Forward");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-
-        //stop
-        currentDirection[0] = 0;
-        currentDirection[1] = 0;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Stop");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-
-
-        //both motors reverse
-        currentDirection[0] = -90;
-        currentDirection[1] = -90;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Reverse");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        //spin in place (left fwd, right rev)
-        currentDirection[0] = 90;    // Left forward
-        currentDirection[1] = -90;   // Right reverse
-        move();
-        ESP_LOGI("MOTOR_TEST", "Spin in place");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        //stop again
-        currentDirection[0] = 0;
-        currentDirection[1] = 0;
-        move();
-        ESP_LOGI("MOTOR_TEST", "Stop");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-    }	
-}
-*/
-
-/*
-//test goalpost mechanism with wifi and server
-void app_main(void)
-{
-    doBlink();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    //ESP_LOGI("MAIN", "Starting Wi-Fi for goalpost...");
-
-    //wifi_setup_init();
-
-    xTaskCreate(goalpost_mechanism_task,
-                "goalpost_task",
-                4096,
-                NULL,
-                4,
-                NULL);
-
-    
-    if (wifi_setup_init()) {
-        ESP_LOGI("MAIN", "Wi-Fi connected, starting goalpost task");
-        xTaskCreate(goalpost_mechanism_task,
-                    "goalpost_task",
-                    4096,      // stack size
-                    NULL,
-                    4,         // priority
-                    NULL);
-    } else {
-        ESP_LOGE("MAIN", "Wi-Fi setup failed, not starting goalpost task");
+    else
+    {
+        set_ledc_duty(LEDC_CH_B_FWD, 0);
+        set_ledc_duty(LEDC_CH_B_REV, rightDuty);
     }
-    
 }
-*/
 
+static void doBlink(void)
+{
+    ESP_ERROR_CHECK(gpio_reset_pin(BLINK_GPIO));
+    ESP_ERROR_CHECK(gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT));
+    ESP_ERROR_CHECK(gpio_set_level(BLINK_GPIO, 1));
+}
 
-//PWM movement test code (without Wi-Fi or server stuff)
+/* -------------------------------------------------------------------------- */
+/* Current application entry point: PWM movement test without Wi-Fi            */
+/* -------------------------------------------------------------------------- */
+
 void app_main(void)
 {
     doBlink();
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    //allocate and initialize movement struct
-    moveStruct = malloc(sizeof(Movement));
-    *moveStruct = (Movement){ .forward = false, .left = false, .right = false, .back = false };
-
-    charging  = false;
-    inGame    = false;
-    resetting = false;
-
-    //create the binary semaphore used by doMovement()
     waitForData = xSemaphoreCreateBinary();
+    if (waitForData == NULL)
+    {
+        ESP_LOGE(TAG, "Could not create movement semaphore");
+        return;
+    }
 
-    //init hardware timer used inside doMovement() / pwmFunction()
-    timer_init(TIMER_GROUP_0, TIMER_0, &config);
-
-    //set up LEDC PWM on the DRV8833 pins
+    movement_timer_setup();
     ledc_setup();
 
-    ESP_LOGI("TEST", "Starting PWM movement test (no Wi-Fi)");
+    ESP_LOGI(TAG, "Starting PWM movement test without Wi-Fi");
 
-    //start the movement task (same one used in the real game)
-    xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
+    const BaseType_t created = xTaskCreate(
+        doMovement,
+        "doMovement",
+        8192,
+        NULL,
+        3,
+        &doMovementHandle);
 
-    //give doMovement time to run its first test move
-    //it ramps from currentDirection to stop, then waits on the semaphore
+    if (created != pdPASS)
+    {
+        doMovementHandle = NULL;
+        ESP_LOGE(TAG, "Could not create movement task");
+        return;
+    }
+
+    /*
+     * Allow the movement task to complete its initial stop-to-stop ramp and
+     * block on the semaphore.
+     */
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // test fake streaming commands
-    // u = forward, d = back, l = left, r = right
-    // combinations like "ur" = forward-right, "dl" = back-left, "" = stop
-    const char *commands[] = {
-        "u",   // full forward
-        "d",   // full back
-        "ul",  // forward-left
-        "ur",  // forward-right
-        "dl",  // back-left
-        "dr",  // back-right
-        "l",   // spin/turn left in place
-        "r",   // spin/turn right in place
-        ""     // stop
+    static const char *commands[] = {
+        "u",
+        "d",
+        "ul",
+        "ur",
+        "dl",
+        "dr",
+        "l",
+        "r",
+        "",
     };
 
-    const char *command_names[] = {
+    static const char *commandNames[] = {
         "Full forward",
         "Full back",
         "Forward-left",
@@ -987,31 +900,43 @@ void app_main(void)
         "Back-right",
         "Left turn/spin",
         "Right turn/spin",
-        "Stop"
+        "Stop",
     };
 
-    const int num_cmds = sizeof(commands) / sizeof(commands[0]);
+    const size_t commandCount = sizeof(commands) / sizeof(commands[0]);
 
-    for (int i = 0; i < num_cmds; i++) {
-        const char *cmd = commands[i];
-        int len = strlen(cmd);
+    for (size_t i = 0; i < commandCount; i++)
+    {
+        const char *command = commands[i];
+        const int commandLength = (int)strlen(command);
 
-        //function parses 'u', 'd', 'l', 'r' exactly like in the real game
-        setMoveStruct((char *)cmd, len);
+        setMoveStruct((char *)command, commandLength);
 
-        ESP_LOGI("TEST", ">>> Command %d: %s (\"%s\")", i + 1, command_names[i], cmd[0] ? cmd : "none/stop");
+        if (!finishedMoving)
+        {
+            interruptMovement = true;
+        }
 
-        //wake up the movement task so it ramps to the new target
+        ESP_LOGI(
+            TAG,
+            "Command %u: %s (\"%s\")",
+            (unsigned)(i + 1U),
+            commandNames[i],
+            command[0] != '\0' ? command : "none/stop");
+
         xSemaphoreGive(waitForData);
 
-        //let the robot move for a bit (3 seconds per command)
+        /*
+         * The ramp takes 500 ms. One second gives the robot time to reach and
+         * hold each requested command briefly.
+         */
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    ESP_LOGI("TEST", "Command sequence complete. Holding stop.");
+    ESP_LOGI(TAG, "Command sequence complete; holding stop");
 
-    //keep the task alive, doMovement will sit at the stop target
-    while (1) {
+    while (true)
+    {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
