@@ -30,9 +30,9 @@
 #include "freertos/semphr.h"
 
 #define PORT					30000
-#define KEEPALIVE_IDLE			60
-#define KEEPALIVE_INTERVAL		10
-#define KEEPALIVE_COUNT			3
+#define KEEPALIVE_IDLE			CONFIG_KEEPALIVE_IDLE
+#define KEEPALIVE_INTERVAL		CONFIG_KEEPALIVE_INTERVAL
+#define KEEPALIVE_COUNT			CONFIG_KEEPALIVE_COUNT
 
 #define BLINK_GPIO 15
 #define BLINK_PERIOD 1000
@@ -274,7 +274,7 @@ void doMovement(void *pvParameters)
 		while(true)
 		{
 			uint64_t x = 0;
-			ESP_ERROR_CHECK(gptimer_get_raw_count(timer, &x));
+			timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &x);
 			//we'll need to do x / 2 - 250 for two reasons. First, we divide by 2 because the timer increments every half a millisecond, so its value
 			//is double what we need. Also, it only allows positive values, so we have to make it from 0-500 and then subtract by 250 to get -250 to 250.
 			ESP_LOGI("DEBUG", "Direction Left is %f, Direction Right is %f, forward is %d, left is %d, right is %d, back is %d, x is %d.", 
@@ -284,7 +284,7 @@ void doMovement(void *pvParameters)
 			if(x >= 1000)
 			{
 				//pause our hardware timer so it's not constantly running, and break out the loop to begin waiting
-				ESP_ERROR_CHECK(gptimer_stop(timer));
+				timer_pause(TIMER_GROUP_0, TIMER_0);
 				break;
 			}
 
@@ -679,15 +679,11 @@ void app_main() {
 	//allocate space for struct, initially set everything to false
 	moveStruct = malloc(sizeof(Movement));
 	*moveStruct = (Movement) {false, false, false, false};
-
 	charging = false;
 	inGame = false;
 	resetting = false;
-
 	waitForData = xSemaphoreCreateBinary();
-    
 	ESP_ERROR_CHECK(gptimer_new_timer(&config, &timer));
-
 	ledc_setup();
 	
 	doBlink();

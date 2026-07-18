@@ -11,7 +11,7 @@
 #include "nvs_flash.h"
 #include "string.h"
 
-#define WIFI_SSID				"soccer_robots_pi"
+#define WIFI_SSID				"piHotspotSr"
 #define WIFI_PASS				"soccerrobots"
 #define WIFI_MAXIMUM_RETRY		5
 

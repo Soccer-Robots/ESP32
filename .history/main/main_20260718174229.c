@@ -30,9 +30,9 @@
 #include "freertos/semphr.h"
 
 #define PORT					30000
-#define KEEPALIVE_IDLE			60
-#define KEEPALIVE_INTERVAL		10
-#define KEEPALIVE_COUNT			3
+#define KEEPALIVE_IDLE			CONFIG_KEEPALIVE_IDLE
+#define KEEPALIVE_INTERVAL		CONFIG_KEEPALIVE_INTERVAL
+#define KEEPALIVE_COUNT			CONFIG_KEEPALIVE_COUNT
 
 #define BLINK_GPIO 15
 #define BLINK_PERIOD 1000
@@ -687,7 +687,6 @@ void app_main() {
 	waitForData = xSemaphoreCreateBinary();
     
 	ESP_ERROR_CHECK(gptimer_new_timer(&config, &timer));
-
 	ledc_setup();
 	
 	doBlink();
