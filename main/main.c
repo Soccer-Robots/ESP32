@@ -192,7 +192,6 @@ void beginMoving()
 	startTargets[0] = currentDirection[0];
 	startTargets[1] = currentDirection[1];
 	ESP_ERROR_CHECK(gptimer_set_raw_count(timer, 0));
-	// begin our timer
 	ESP_ERROR_CHECK(gptimer_start(timer));
 	//get final targets here
 	if(moveStruct->forward)
@@ -297,6 +296,7 @@ void doMovement(void *pvParameters)
 			//if we're given command to interrupt movement due to new keys before we finish, break anyways
 			if(interruptMovement)
 			{
+				ESP_ERROR_CHECK(gptimer_stop(timer));
 				break;
 			}
 		}
