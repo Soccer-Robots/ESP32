@@ -381,9 +381,6 @@ static void on_receive(const int sock)
 				{
 					//send ready
 					sendMessage(sock, "ready");
-					inGame = true;
-					//set up movement as we about to begin the game
-					xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
 				}
 				continue;
 			}
@@ -404,6 +401,16 @@ static void on_receive(const int sock)
 				//for now, we can probably just break our esp out of this on receive, that will also destroy the movement task. Though, that's only after we finish moving.
 				break;
 			}
+			
+			if(len >= 10 && strncmp(rx_buffer, "start-game", 10) == 0)
+			{
+				inGame = true;
+				//set up movement as we about to begin the game
+				xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
+				ESP_LOGI("MESSAGE", "starting game!");
+				continue;
+			}
+			
 			//if received an ignore message, ignore it
 			if(len >= 6 && strncmp(rx_buffer, "ignore", 6) == 0)
 			{
