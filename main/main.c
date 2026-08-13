@@ -5,6 +5,7 @@
 #include "freertos/projdefs.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "lwip/tcp.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -29,7 +30,6 @@
 #include <fcntl.h>
 #include "freertos/semphr.h"
 
-#define PORT					30000
 #define KEEPALIVE_IDLE			60
 #define KEEPALIVE_INTERVAL		10
 #define KEEPALIVE_COUNT			3
@@ -381,9 +381,6 @@ static void on_receive(const int sock)
 				{
 					//send ready
 					sendMessage(sock, "ready");
-					inGame = true;
-					//set up movement as we about to begin the game
-					xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
 				}
 				continue;
 			}
@@ -404,6 +401,16 @@ static void on_receive(const int sock)
 				//for now, we can probably just break our esp out of this on receive, that will also destroy the movement task. Though, that's only after we finish moving.
 				break;
 			}
+			
+			if(len >= 10 && strncmp(rx_buffer, "start-game", 10) == 0)
+			{
+				inGame = true;
+				//set up movement as we about to begin the game
+				xTaskCreate(doMovement, "doMovement", 8192, NULL, 3, &doMovementHandle);
+				ESP_LOGI("MESSAGE", "starting game!");
+				continue;
+			}
+			
 			//if received an ignore message, ignore it
 			if(len >= 6 && strncmp(rx_buffer, "ignore", 6) == 0)
 			{
@@ -441,90 +448,64 @@ static void on_receive(const int sock)
 }
 
 //overall handles connection with the pi through a TCP connection with a socket.
-void taskServer(void *pvParameters){	
-	char* TAG = "SERVER";
-    char addr_str[128];
+void taskClient(void *pvParameters){	
+	char* TAG = "CLIENT";
     int addr_family = (int)pvParameters;
-    int ip_protocol = 0;
+    int ip_protocol = IPPROTO_TCP;
     int keepAlive = 1;
     int keepIdle = KEEPALIVE_IDLE;
     int keepInterval = KEEPALIVE_INTERVAL;
     int keepCount = KEEPALIVE_COUNT;
-    struct sockaddr_storage dest_addr;
 
-	// IPv4 Socket Structure Configuration, using current IP and selected Port #
-    if (addr_family == AF_INET) {
-        struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
-        dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
-        dest_addr_ip4->sin_family = AF_INET;
-        dest_addr_ip4->sin_port = htons(PORT);
-        ip_protocol = IPPROTO_IP;
-    }
+	const int PORT = 5000;
+	const char* IP_ADDR = "10.42.0.1";
 
-	// Create Socket
-    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    ESP_LOGI(TAG, "Socket created");
+	struct sockaddr_in dest_addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(PORT),
+	};
 
-	// Bind socket to current IP address using newly created structure
-    int err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err != 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        ESP_LOGE(TAG, "IPPROTO: %d", addr_family);
-        goto CLEAN_UP;
-    }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-
-	// Start listening for connections
-    err = listen(listen_sock, 1);
-    if (err != 0) {
-        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
-        goto CLEAN_UP;
-    }
+	inet_pton(AF_INET, IP_ADDR, &dest_addr.sin_addr);
 
 	//continue reading until socket breaks, then loop back
     while (1) 
 	{
-        ESP_LOGI(TAG, "Socket listening");
-		
-		// Accept a connection, collect client's IP
-		struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
-        socklen_t addr_len = sizeof(source_addr);
-        int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
-            break;
-        }
+		// Create Socket
+		int client_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
+		if (client_sock < 0) {
+			ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+			vTaskDelete(NULL);
+			return;
+		}
+		int opt = 1;
 
+		ESP_LOGI(TAG, "Socket created");
+		
+		ESP_LOGI(TAG, "Socket connecting");
+		int connectStatus = connect(client_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+		if  (connectStatus != 0)
+		{
+			ESP_LOGE(TAG, "Unable to conncet to server: errno %d", errno);
+			close(client_sock);
+			continue;
+		}
+
+		ESP_LOGI(TAG, "Socket connected");
+		
         // Set tcp keepalive option
-        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
-        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+        setsockopt(client_sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+        setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+        setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+		setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
 
 		//Still having it block
 		// int prevFlags = fcntl(sock, F_GETFL, 0);
 		// fcntl(listen_sock, F_SETFL, prevFlags | O_NONBLOCK);
 
-        // Convert ip address to string
-		if (source_addr.ss_family == PF_INET) {
-            inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
-        }
-        ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
-		//create task to do movement
-
 		// Respond to client
-        on_receive(sock);
-
-		// Close client socket
-        shutdown(sock, 0);
+        on_receive(client_sock);
 
 		//before finishing the movement task, spin until it's done.
 		while(finishedMoving != true)
@@ -537,12 +518,8 @@ void taskServer(void *pvParameters){
 		vTaskDelete(doMovementHandle);
 		doMovementHandle = NULL;
 
-        close(sock);
+        close(client_sock);
     }
-
-CLEAN_UP:
-    close(listen_sock);
-    vTaskDelete(NULL);
 }
 
 //Raw Duty = (Percent/100) * (2^LEDC_DUTY_RES)
@@ -705,7 +682,7 @@ void app_main() {
 		/* 		1,				// Priority */
 		/* 		NULL //handle to delete task
 		); */
-		xTaskCreate(taskServer, "taskServer", 4096, (void*)AF_INET, 3, NULL);
+		xTaskCreate(taskClient, "taskClient", 4096, (void*)AF_INET, 3, NULL);
 	}
 
 	vTaskDelay(pdMS_TO_TICKS(500));
